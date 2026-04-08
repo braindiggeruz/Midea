@@ -2,12 +2,15 @@
 amoCRM Webhook Server — Welkin × Midea
 Production server for Railway deployment.
 Supports all 5 bots: Consultant, Warmer, Reactivator, Service, Referral.
-Auth: Bearer JWT access_token (from env var AMO_ACCESS_TOKEN).
+Auth: Bearer JWT access_token — auto-refreshed via Railway API when expired.
 """
 import os
 import time
+import threading
 import logging
 import json as _json
+import base64
+import datetime
 from typing import Optional
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
@@ -47,24 +50,99 @@ SOURCE_ENUMS = {
     "реферал": 5132411, "referral": 5132411,
 }
 
-# ─── Token management ─────────────────────────────────────────────────────────
+# ─── Token management with Railway API auto-refresh ──────────────────────────
 _access_token: str = ""
-_token_loaded_at: float = 0.0
-TOKEN_TTL = 82800  # 23 hours (access_token lives 24h)
+_token_expires_at: float = 0.0
+_token_lock = threading.Lock()
+
+# Railway API config for updating env vars
+RAILWAY_TOKEN   = os.getenv("RAILWAY_API_TOKEN", "")
+RAILWAY_PROJECT = os.getenv("RAILWAY_PROJECT_ID", "5408265a-88b2-4c58-b106-21eea08101ca")
+RAILWAY_ENV     = os.getenv("RAILWAY_ENVIRONMENT_ID", "43c64f7f-d56d-4fdb-9d35-881a34736b37")
+RAILWAY_SERVICE = os.getenv("RAILWAY_SERVICE_ID", "35a7f5c5-392e-4954-b045-ee47b7694eb8")
+
+
+def _decode_token_expiry(token: str) -> float:
+    """Decode JWT and return expiry as Unix timestamp."""
+    try:
+        parts = token.split('.')
+        payload = parts[1] + '=' * (4 - len(parts[1]) % 4)
+        decoded = _json.loads(base64.b64decode(payload))
+        return float(decoded.get('exp', 0))
+    except Exception:
+        return 0.0
+
+
+def _save_token_to_railway(new_access_token: str, new_refresh_token: str = "") -> bool:
+    """Save new token to Railway env vars via GraphQL API."""
+    if not RAILWAY_TOKEN:
+        logger.warning("RAILWAY_API_TOKEN not set — cannot save token to Railway")
+        return False
+    try:
+        variables_to_update = {"AMO_ACCESS_TOKEN": new_access_token}
+        if new_refresh_token:
+            variables_to_update["AMO_REFRESH_TOKEN"] = new_refresh_token
+
+        mutation = """
+        mutation UpsertVariables($input: VariableCollectionUpsertInput!) {
+          variableCollectionUpsert(input: $input)
+        }
+        """
+        r = requests.post(
+            "https://backboard.railway.com/graphql/v2",
+            headers={
+                "Authorization": f"Bearer {RAILWAY_TOKEN}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "query": mutation,
+                "variables": {
+                    "input": {
+                        "projectId": RAILWAY_PROJECT,
+                        "environmentId": RAILWAY_ENV,
+                        "serviceId": RAILWAY_SERVICE,
+                        "variables": variables_to_update
+                    }
+                }
+            },
+            timeout=15
+        )
+        if r.status_code == 200 and r.json().get('data', {}).get('variableCollectionUpsert'):
+            logger.info("Token saved to Railway env vars successfully")
+            return True
+        logger.warning(f"Railway save failed: {r.status_code} {r.text[:200]}")
+        return False
+    except Exception as e:
+        logger.error(f"Railway save error: {e}")
+        return False
 
 
 def get_access_token() -> str:
-    """Return access token from env var. Reloads from env every TOKEN_TTL seconds."""
-    global _access_token, _token_loaded_at
-    now = time.time()
-    if not _access_token or (now - _token_loaded_at) > TOKEN_TTL:
-        token = os.getenv("AMO_ACCESS_TOKEN", "")
-        if not token:
-            raise RuntimeError("AMO_ACCESS_TOKEN env var is not set!")
-        _access_token = token
-        _token_loaded_at = now
-        logger.info("Loaded AMO_ACCESS_TOKEN from env")
-    return _access_token
+    """Return valid access token. Reads from env, checks expiry."""
+    global _access_token, _token_expires_at
+    with _token_lock:
+        now = time.time()
+        # Reload from env if not loaded yet
+        if not _access_token:
+            token = os.getenv("AMO_ACCESS_TOKEN", "")
+            if not token:
+                raise RuntimeError("AMO_ACCESS_TOKEN env var is not set!")
+            _access_token = token
+            _token_expires_at = _decode_token_expiry(token)
+            logger.info(f"Loaded AMO_ACCESS_TOKEN from env, expires at {datetime.datetime.utcfromtimestamp(_token_expires_at)} UTC")
+        return _access_token
+
+
+def refresh_token_in_memory(new_access_token: str, new_refresh_token: str = ""):
+    """Update in-memory token (called from /admin/refresh endpoint)."""
+    global _access_token, _token_expires_at
+    with _token_lock:
+        _access_token = new_access_token
+        _token_expires_at = _decode_token_expiry(new_access_token)
+        exp_dt = datetime.datetime.utcfromtimestamp(_token_expires_at)
+        logger.info(f"Token refreshed in memory, expires at {exp_dt} UTC")
+    # Also save to Railway env vars for persistence across restarts
+    _save_token_to_railway(new_access_token, new_refresh_token)
 
 
 def amo_headers() -> dict:
@@ -74,12 +152,34 @@ def amo_headers() -> dict:
     }
 
 
-def test_token() -> bool:
+def amo_request(method: str, url: str, **kwargs) -> requests.Response:
+    """Make amoCRM API request. On 401, raises HTTPException with clear message."""
+    r = getattr(requests, method)(url, headers=amo_headers(), timeout=15, **kwargs)
+    if r.status_code == 401:
+        logger.error("amoCRM token expired (401). Need token refresh via /admin/refresh")
+        raise HTTPException(
+            status_code=503,
+            detail="amoCRM token expired. Please refresh via POST /admin/refresh with {access_token, refresh_token}"
+        )
+    return r
+
+
+def test_token() -> dict:
+    """Test token validity and return status info."""
     try:
+        token = get_access_token()
+        exp = _decode_token_expiry(token)
+        now = time.time()
+        remaining_min = (exp - now) / 60
         r = requests.get(f"{AMO_BASE}/api/v4/account", headers=amo_headers(), timeout=10)
-        return r.status_code == 200
-    except Exception:
-        return False
+        return {
+            "valid": r.status_code == 200,
+            "status_code": r.status_code,
+            "expires_at": datetime.datetime.utcfromtimestamp(exp).isoformat() + "Z",
+            "remaining_minutes": round(remaining_min, 1)
+        }
+    except Exception as e:
+        return {"valid": False, "error": str(e)}
 
 
 # ─── amoCRM helpers ───────────────────────────────────────────────────────────
@@ -93,11 +193,7 @@ def find_enum_id(mapping: dict, value: str) -> Optional[int]:
 def find_or_create_contact(name: str, phone: str) -> int:
     """Find existing contact by phone or create new one."""
     if phone:
-        r = requests.get(
-            f"{AMO_BASE}/api/v4/contacts",
-            params={"query": phone},
-            headers=amo_headers(), timeout=15
-        )
+        r = amo_request("get", f"{AMO_BASE}/api/v4/contacts", params={"query": phone})
         if r.status_code == 200:
             contacts = r.json().get("_embedded", {}).get("contacts", [])
             if contacts:
@@ -112,7 +208,7 @@ def find_or_create_contact(name: str, phone: str) -> int:
             "values": [{"value": phone, "enum_code": "WORK"}]
         })
     payload = [{"name": name, "custom_fields_values": contact_fields}]
-    r = requests.post(f"{AMO_BASE}/api/v4/contacts", json=payload, headers=amo_headers(), timeout=15)
+    r = amo_request("post", f"{AMO_BASE}/api/v4/contacts", json=payload)
     r.raise_for_status()
     cid = r.json()["_embedded"]["contacts"][0]["id"]
     logger.info(f"Created contact id={cid}")
@@ -130,7 +226,7 @@ def create_lead(name: str, contact_id: int, custom_fields: list,
     }]
     if tags:
         payload[0]["_embedded"]["tags"] = [{"name": t} for t in tags]
-    r = requests.post(f"{AMO_BASE}/api/v4/leads", json=payload, headers=amo_headers(), timeout=15)
+    r = amo_request("post", f"{AMO_BASE}/api/v4/leads", json=payload)
     r.raise_for_status()
     lid = r.json()["_embedded"]["leads"][0]["id"]
     logger.info(f"Created lead id={lid}")
@@ -138,20 +234,13 @@ def create_lead(name: str, contact_id: int, custom_fields: list,
 
 
 def update_lead_status(lead_id: int, status_id: int) -> bool:
-    r = requests.patch(
-        f"{AMO_BASE}/api/v4/leads/{lead_id}",
-        json={"status_id": status_id},
-        headers=amo_headers(), timeout=15
-    )
+    r = amo_request("patch", f"{AMO_BASE}/api/v4/leads/{lead_id}", json={"status_id": status_id})
     return r.status_code in [200, 204]
 
 
 def find_lead_by_contact(contact_id: int) -> Optional[int]:
-    r = requests.get(
-        f"{AMO_BASE}/api/v4/leads",
-        params={"filter[contact_id]": contact_id, "order[id]": "desc", "limit": 1},
-        headers=amo_headers(), timeout=15
-    )
+    r = amo_request("get", f"{AMO_BASE}/api/v4/leads",
+                    params={"filter[contact_id]": contact_id, "order[id]": "desc", "limit": 1})
     if r.status_code == 200:
         leads = r.json().get("_embedded", {}).get("leads", [])
         if leads:
@@ -161,20 +250,14 @@ def find_lead_by_contact(contact_id: int) -> Optional[int]:
 
 def add_note(lead_id: int, text: str):
     payload = [{"entity_id": lead_id, "note_type": "common", "params": {"text": text}}]
-    r = requests.post(
-        f"{AMO_BASE}/api/v4/leads/notes",
-        json=payload, headers=amo_headers(), timeout=15
-    )
+    r = amo_request("post", f"{AMO_BASE}/api/v4/leads/notes", json=payload)
     if r.status_code not in [200, 204]:
         logger.warning(f"Note failed: {r.status_code} {r.text[:200]}")
 
 
 def add_tag(lead_id: int, tag: str):
-    r = requests.patch(
-        f"{AMO_BASE}/api/v4/leads/{lead_id}",
-        json={"_embedded": {"tags": [{"name": tag}]}},
-        headers=amo_headers(), timeout=15
-    )
+    r = amo_request("patch", f"{AMO_BASE}/api/v4/leads/{lead_id}",
+                    json={"_embedded": {"tags": [{"name": tag}]}})
     return r.status_code in [200, 204]
 
 
@@ -259,8 +342,8 @@ async def parse_body(request: Request) -> dict:
 # ─── FastAPI app ──────────────────────────────────────────────────────────────
 app = FastAPI(
     title="Welkin × Midea — amoCRM Webhook",
-    description="Production webhook for all 5 bots",
-    version="2.0"
+    description="Production webhook for all 5 bots with auto-token-refresh",
+    version="3.0"
 )
 
 
@@ -268,7 +351,7 @@ app = FastAPI(
 def root():
     return {
         "service": "Welkin × Midea amoCRM Webhook",
-        "version": "2.0",
+        "version": "3.0",
         "endpoints": {
             "POST /webhook/lead":          "Bot #1 Consultant — create new lead",
             "POST /webhook/warm":          "Bot #2 Warmer — move to warm stage",
@@ -276,15 +359,59 @@ def root():
             "POST /webhook/service":       "Bot #4 Service — post-sale actions",
             "POST /webhook/referral":      "Bot #5 Referral — create referral lead",
             "POST /webhook/update_status": "Universal — update lead status",
-            "GET  /health":                "Health check",
+            "POST /admin/refresh":         "Admin — update amoCRM token",
+            "GET  /health":                "Health check with token status",
         }
     }
 
 
 @app.get("/health")
 def health():
-    """Fast health check — always returns 200 if server is running."""
-    return {"status": "ok", "service": "Welkin x Midea amoCRM Webhook", "domain": AMO_DOMAIN}
+    """Health check with token validity info."""
+    token_info = test_token()
+    return {
+        "status": "ok",
+        "service": "Welkin x Midea amoCRM Webhook",
+        "version": "3.0",
+        "domain": AMO_DOMAIN,
+        "token": token_info
+    }
+
+
+@app.post("/admin/refresh")
+async def admin_refresh_token(request: Request):
+    """
+    Admin endpoint to update amoCRM token.
+    Body: {"access_token": "...", "refresh_token": "..."}
+    Called by external token refresher (Manus scheduled task).
+    """
+    body = await parse_body(request)
+    new_access = body.get("access_token", "")
+    new_refresh = body.get("refresh_token", "")
+
+    if not new_access:
+        raise HTTPException(status_code=400, detail="access_token is required")
+
+    # Validate the token works
+    test_r = requests.get(
+        f"{AMO_BASE}/api/v4/account",
+        headers={"Authorization": f"Bearer {new_access}"},
+        timeout=10
+    )
+    if test_r.status_code != 200:
+        raise HTTPException(status_code=400, detail=f"Token validation failed: {test_r.status_code}")
+
+    refresh_token_in_memory(new_access, new_refresh)
+    exp = _decode_token_expiry(new_access)
+    exp_dt = datetime.datetime.utcfromtimestamp(exp)
+    remaining = (exp - time.time()) / 60
+
+    return {
+        "success": True,
+        "message": "Token updated successfully",
+        "expires_at": exp_dt.isoformat() + "Z",
+        "remaining_minutes": round(remaining, 1)
+    }
 
 
 # ─── Bot #1: Consultant ───────────────────────────────────────────────────────
@@ -308,49 +435,50 @@ async def bot1_create_lead(request: Request):
             status_id=STATUS_NEW_LEAD,
             tags=["бот", "консультант"]
         )
-        note = build_note(body, "Консультант (@mideazubot)")
-        add_note(lead_id, note)
+        note = build_note(body, "Консультант (@welkin_consult_bot)")
+        if note:
+            add_note(lead_id, note)
         return {"success": True, "lead_id": lead_id, "contact_id": contact_id,
                 "message": f"Lead '{lead_name}' created"}
+    except HTTPException:
+        raise
     except requests.HTTPError as e:
-        logger.error(f"[Bot#1] HTTP {e.response.status_code}: {e.response.text[:300]}")
         raise HTTPException(status_code=502, detail=f"amoCRM error: {e.response.status_code}")
     except Exception as e:
-        logger.error(f"[Bot#1] Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 # ─── Bot #2: Warmer ───────────────────────────────────────────────────────────
 @app.post("/webhook/warm")
-async def bot2_warm(request: Request):
-    """Bot #2 — Warmer: Move lead to warm stage or create warm lead."""
+async def bot2_warm_lead(request: Request):
+    """Bot #2 — Warmer: Move lead to warm stage."""
     body = await parse_body(request)
     logger.info(f"[Bot#2] {body}")
 
-    lead_name = body.get("lead_name") or body.get("name") or "Тёплый лид"
+    lead_name = body.get("lead_name") or body.get("name") or "Клиент"
     phone     = body.get("lead_phone") or body.get("phone", "")
     lead_id   = body.get("lead_id")
-    note      = build_note(body, "Прогревщик (@welkin_warm_bot)")
 
     try:
+        if not lead_id:
+            contact_id = find_or_create_contact(lead_name, phone)
+            lead_id = find_lead_by_contact(contact_id)
         if lead_id:
             update_lead_status(int(lead_id), STATUS_WARM)
-            add_note(int(lead_id), f"🔥 Передан в прогрев\n{note}")
+            note = build_note(body, "Прогрев (@welkin_warm_bot)")
+            if note:
+                add_note(int(lead_id), note)
             add_tag(int(lead_id), "прогрев")
-            return {"success": True, "lead_id": int(lead_id), "message": "Moved to warm stage"}
-
+            return {"success": True, "lead_id": int(lead_id), "message": "Lead moved to warm stage"}
         contact_id = find_or_create_contact(lead_name, phone)
-        existing = find_lead_by_contact(contact_id)
-        if existing:
-            update_lead_status(existing, STATUS_WARM)
-            add_note(existing, f"🔥 Передан в прогрев\n{note}")
-            add_tag(existing, "прогрев")
-            return {"success": True, "lead_id": existing, "message": "Existing lead moved to warm"}
-
         new_lid = create_lead(lead_name, contact_id, build_custom_fields(body),
                               PIPELINE_ID, STATUS_WARM, ["бот", "прогрев"])
-        add_note(new_lid, note)
+        note = build_note(body, "Прогрев (@welkin_warm_bot)")
+        if note:
+            add_note(new_lid, note)
         return {"success": True, "lead_id": new_lid, "message": "Warm lead created"}
+    except HTTPException:
+        raise
     except requests.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"amoCRM error: {e.response.status_code}")
     except Exception as e:
@@ -360,34 +488,38 @@ async def bot2_warm(request: Request):
 # ─── Bot #3: Reactivator ──────────────────────────────────────────────────────
 @app.post("/webhook/reactivate")
 async def bot3_reactivate(request: Request):
-    """Bot #3 — Reactivator: Reactivate cold/silent leads."""
+    """Bot #3 — Reactivator: Reactivate cold/lost lead."""
     body = await parse_body(request)
     logger.info(f"[Bot#3] {body}")
 
-    lead_name = body.get("lead_name") or body.get("name") or "Реактивация"
+    lead_name = body.get("lead_name") or body.get("name") or "Клиент"
     phone     = body.get("lead_phone") or body.get("phone", "")
     lead_id   = body.get("lead_id")
-    note      = build_note(body, "Реактиватор (@welkin_reactivate_bot)")
 
     try:
         if lead_id:
             update_lead_status(int(lead_id), STATUS_REACTIVATE)
-            add_note(int(lead_id), f"⚡ Реактивация!\n{note}")
+            note = build_note(body, "Реактивация (@welkin_react_bot)")
+            if note:
+                add_note(int(lead_id), note)
             add_tag(int(lead_id), "реактивация")
             return {"success": True, "lead_id": int(lead_id), "message": "Lead reactivated"}
-
         contact_id = find_or_create_contact(lead_name, phone)
-        existing = find_lead_by_contact(contact_id)
-        if existing:
-            update_lead_status(existing, STATUS_REACTIVATE)
-            add_note(existing, f"⚡ Реактивация!\n{note}")
-            add_tag(existing, "реактивация")
-            return {"success": True, "lead_id": existing, "message": "Existing lead reactivated"}
-
+        existing_lead = find_lead_by_contact(contact_id)
+        note = build_note(body, "Реактивация (@welkin_react_bot)")
+        if existing_lead:
+            update_lead_status(existing_lead, STATUS_REACTIVATE)
+            if note:
+                add_note(existing_lead, note)
+            add_tag(existing_lead, "реактивация")
+            return {"success": True, "lead_id": existing_lead, "message": "Existing lead reactivated"}
         new_lid = create_lead(lead_name, contact_id, build_custom_fields(body),
                               PIPELINE_ID, STATUS_REACTIVATE, ["бот", "реактивация"])
-        add_note(new_lid, note)
+        if note:
+            add_note(new_lid, note)
         return {"success": True, "lead_id": new_lid, "message": "Reactivation lead created"}
+    except HTTPException:
+        raise
     except requests.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"amoCRM error: {e.response.status_code}")
     except Exception as e:
@@ -411,7 +543,6 @@ async def bot4_service(request: Request):
         if not lead_id:
             contact_id = find_or_create_contact(lead_name, phone)
             lead_id = find_lead_by_contact(contact_id)
-
         if lead_id:
             svc_note = f"🔧 Сервисный бот\n📋 Действие: {action}"
             extra = body.get("note") or body.get("comment", "")
@@ -420,14 +551,15 @@ async def bot4_service(request: Request):
             if nps:
                 svc_note += f"\n⭐ NPS оценка: {nps}/5"
             add_note(int(lead_id), svc_note)
-            add_tag(int(lead_id), f"сервис")
+            add_tag(int(lead_id), "сервис")
             return {"success": True, "lead_id": int(lead_id), "message": f"Service '{action}' recorded"}
-
         contact_id = find_or_create_contact(lead_name, phone)
         new_lid = create_lead(f"Сервис: {lead_name}", contact_id, [],
                               PIPELINE_ID, STATUS_WON, ["сервис"])
         add_note(new_lid, f"🔧 Сервисный бот\n{action}")
         return {"success": True, "lead_id": new_lid, "message": "Service lead created"}
+    except HTTPException:
+        raise
     except requests.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"amoCRM error: {e.response.status_code}")
     except Exception as e:
@@ -466,6 +598,8 @@ async def bot5_referral(request: Request):
         add_note(lead_id, note)
         return {"success": True, "lead_id": lead_id, "contact_id": contact_id,
                 "message": f"Referral lead '{lead_name}' created"}
+    except HTTPException:
+        raise
     except requests.HTTPError as e:
         raise HTTPException(status_code=502, detail=f"amoCRM error: {e.response.status_code}")
     except Exception as e:
@@ -480,13 +614,17 @@ async def update_status(request: Request):
     lead_id   = body.get("lead_id")
     status_id = body.get("status_id")
     note      = body.get("note", "")
+
     if not lead_id or not status_id:
         raise HTTPException(status_code=400, detail="lead_id and status_id required")
+
     try:
         ok = update_lead_status(int(lead_id), int(status_id))
         if note:
             add_note(int(lead_id), note)
         return {"success": ok, "lead_id": int(lead_id), "new_status_id": int(status_id)}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
