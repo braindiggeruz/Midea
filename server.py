@@ -283,13 +283,8 @@ def root():
 
 @app.get("/health")
 def health():
-    try:
-        ok = test_token()
-        if ok:
-            return {"status": "ok", "amo_api": "connected", "domain": AMO_DOMAIN}
-        return JSONResponse(status_code=503, content={"status": "error", "amo_api": "token_invalid"})
-    except Exception as e:
-        return JSONResponse(status_code=503, content={"status": "error", "detail": str(e)})
+    """Fast health check — always returns 200 if server is running."""
+    return {"status": "ok", "service": "Welkin x Midea amoCRM Webhook", "domain": AMO_DOMAIN}
 
 
 # ─── Bot #1: Consultant ───────────────────────────────────────────────────────
